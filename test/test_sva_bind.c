@@ -25,6 +25,7 @@ struct priv_options {
 #define INJECT_SIG_BIND		(1UL << 0)
 #define INJECT_SIG_WORK		(1UL << 1)
 #define INJECT_TLB_FAULT	(1UL << 2)
+#define INJECT_SIG_FINISH	(1UL << 3)
 	unsigned long faults;
 };
 
@@ -118,6 +119,8 @@ static int run_one_child(struct priv_options *opts)
 			WD_ERR("hizip test fail with %d\n", ret);
 			break;
 		}
+		if (opts->faults & INJECT_SIG_FINISH)
+			kill(getpid(), SIGTERM);
 	}
 
 	if (ret >= 0 && opts->faults & INJECT_TLB_FAULT) {
@@ -287,6 +290,9 @@ int main(int argc, char **argv)
 				break;
 			case 'w':
 				opts.faults |= INJECT_SIG_WORK;
+				break;
+			case 'f':
+				opts.faults |= INJECT_SIG_FINISH;
 				break;
 			default:
 				SYS_ERR_COND(1, "invalid argument to -k: '%s'\n", optarg);
