@@ -15,6 +15,8 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <linux/perf_event.h>
+#include <asm/unistd.h>	/* For __NR_perf_event_open */
 
 #include "test_lib.h"
 
@@ -64,6 +66,125 @@ static struct test_ops test_ops = {
 	.output = hizip_test_output,
 };
 
+static int perf_event_open(struct perf_event_attr *attr,
+			   pid_t pid, int cpu, int group_fd,
+			   unsigned long flags)
+{
+	return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
+}
+
+static int *perf_fds;
+static int nr_fds;
+
+static unsigned long long perf_event_put(int *perf_fds, int nr_fds);
+
+static int perf_event_get(const char *event_name, int **perf_fds, int *nr_fds)
+{
+	int ret;
+	int cpu;
+	FILE *fd;
+	int nr_cpus;
+	unsigned int event_id;
+	char event_id_file[256];
+	struct perf_event_attr event = {
+		.type		= PERF_TYPE_TRACEPOINT,
+		.size		= sizeof(event),
+		.disabled	= true,
+	};
+
+	*perf_fds = NULL;
+	*nr_fds = 0;
+
+	nr_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+	if (nr_cpus <= 0) {
+		WD_ERR("invalid number of CPUs\n");
+		return nr_cpus;
+	}
+
+	ret = snprintf(event_id_file, sizeof(event_id_file),
+		       "/sys/kernel/debug/tracing/events/%s/id", event_name);
+	if (ret >= sizeof(event_id_file)) {
+		WD_ERR("event_id buffer overflow\n");
+		return -EOVERFLOW;
+	}
+	fd = fopen(event_id_file, "r");
+	if (fd == NULL) {
+		ret = -errno;
+		WD_ERR("Couldn't open file %s\n", event_id_file);
+		return ret;
+	}
+
+	if (fscanf(fd, "%d", &event_id) != 1) {
+		WD_ERR("Couldn't parse file %s\n", event_id_file);
+		return -EINVAL;
+	}
+	fclose(fd);
+	event.config = event_id;
+
+	*perf_fds = calloc(nr_cpus, sizeof(int));
+	if (!*perf_fds)
+		return -ENOMEM;
+	*nr_fds = nr_cpus;
+
+	/*
+	 * An event is bound to either a CPU or a PID. If we want both, we need
+	 * to open the event on all CPUs. Note that we can't use a perf group
+	 * since they have to be on the same CPU.
+	 */
+	for (cpu = 0; cpu < nr_cpus; cpu++) {
+		int fd = perf_event_open(&event, -1, cpu, -1, 0);
+
+		if (fd < 0) {
+			WD_ERR("Couldn't get perf event %s on CPU%d: %d\n",
+			       event_name, cpu, errno);
+			perf_event_put(*perf_fds, cpu);
+			return fd;
+		}
+
+		ioctl(fd, PERF_EVENT_IOC_RESET, 0);
+		ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
+		(*perf_fds)[cpu] = fd;
+	}
+
+	return 0;
+}
+
+/*
+ * Closes the perf fd and return the sample count. If it wasn't open, return 0.
+ */
+static unsigned long long perf_event_put(int *perf_fds, int nr_fds)
+{
+	int ret;
+	int cpu;
+	uint64_t count, total = 0;
+
+	if (!perf_fds)
+		return 0;
+
+	for (cpu = 0; cpu < nr_fds; cpu++) {
+		int fd = perf_fds[cpu];
+
+		if (fd <= 0) {
+			WD_ERR("Invalid perf fd %d\n", cpu);
+			continue;
+		}
+
+		ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
+
+		ret = read(fd, &count, sizeof(count));
+		if (ret < sizeof(count))
+			WD_ERR("Couldn't read perf event for CPU%d\n", cpu);
+
+		total += count;
+		close(fd);
+
+	}
+
+	free(perf_fds);
+	return total;
+}
+
+
 static int run_one_child(struct priv_options *opts)
 {
 	int i;
@@ -98,6 +219,7 @@ static int run_one_child(struct priv_options *opts)
 	}
 
 	hizip_prepare_random_input_data(ctx);
+	perf_event_get("iommu/dev_fault", &perf_fds, &nr_fds);
 
 	ret = hizip_test_init(&sched, copts, &test_ops, &priv_ctx);
 	if (ret) {
@@ -254,6 +376,17 @@ static void handle_sigbus(int sig)
 	        _exit(0);
 }
 
+static void handle_sigint(int sig)
+{
+	    printf("ctrl-c: iopf=%lld\n", perf_event_put(perf_fds, nr_fds));
+	        _exit(0);
+}
+static void handle_sigterm(int sig)
+{
+	    printf("sigterm: iopf=%lld\n", perf_event_put(perf_fds, nr_fds));
+	        _exit(0);
+}
+
 int main(int argc, char **argv)
 {
 	int opt;
@@ -307,6 +440,8 @@ int main(int argc, char **argv)
 	}
 
 	signal(SIGBUS, handle_sigbus);
+	signal(SIGTERM, handle_sigterm);
+	signal(SIGINT, handle_sigint);
 
 	hizip_test_adjust_len(&opts.common);
 
